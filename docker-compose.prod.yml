@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # Bidwatt API & Control Plane
+  bidwatt-control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - PORT=3000
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - bidwatt-network
+
+  # Postgres with Automated Backups
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bidwatt}
+      POSTGRES_USER: ${POSTGRES_USER:-bidwatt_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_pilot_pwd}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/backups:/backups
+    networks:
+      - bidwatt-network
+
+  # Redis for Distributed Rate Limiting & Heartbeat Monitoring
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - bidwatt-network
+
+networks:
+  bidwatt-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

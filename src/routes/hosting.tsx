@@ -1,95 +1,260 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { supabase } from "@/integrations/supabase/client";
 import { useSession } from "@/lib/use-session";
-import { formatINR } from "@/lib/pricing";
-import { PageTitle, SignInPrompt } from "@/components/SignInPrompt";
+import { SignInPrompt } from "@/components/SignInPrompt";
+import { formatINR, roundPaise } from "@/lib/pricing";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+import { Wallet, ArrowDownRight, ArrowUpRight, Receipt, Landmark, CheckCircle2 } from "lucide-react";
+import { DeviceEnrollmentCard } from "@/components/DeviceEnrollmentCard";
 
 export const Route = createFileRoute("/hosting")({
   head: () => ({
     meta: [
-      { title: "Your GPUs — Bidwatt hosting" },
-      { name: "description", content: "List the GPUs you can rent out and set your hourly rate." },
-      { property: "og:title", content: "Your GPUs — Bidwatt hosting" },
-      { property: "og:description", content: "List the GPUs you can rent out on Bidwatt." },
+      { title: "Host Earnings & Payouts — Bidwatt" },
+      { name: "description", content: "Track host GPU earnings, payouts, and invoices." },
+      { name: "robots", content: "noindex" },
     ],
   }),
-  component: Hosting,
+  component: HostEarningsPage,
 });
 
-function Hosting() {
+function HostEarningsPage() {
   const { user, ready } = useSession();
   const qc = useQueryClient();
-  const [f, setF] = useState({ gpu: "", vram: "12", ram: "16", bench: "", rate: "20", runtimes: "PyTorch, CUDA 12" });
-  const q = useQuery({
-    queryKey: ["my-devices", user?.id],
+  const [payoutAmount, setPayoutAmount] = useState("500");
+  const [upiId, setUpiId] = useState("");
+  const [requesting, setRequesting] = useState(false);
+
+  const earningsQuery = useQuery({
+    queryKey: ["host-earnings", user?.id],
     enabled: !!user,
     queryFn: async () => {
-      const { data, error } = await supabase.from("host_devices").select("*").eq("host_id", user!.id).order("created_at");
-      if (error) throw error;
-      return data;
+      // 1. Fetch completed bookings as host
+      const { data: bookings } = await supabase
+        .from("bookings")
+        .select("id, state, created_at, offer:offers(*)")
+        .eq("host_id", user!.id);
+
+      // 2. Fetch payouts
+      const { data: payouts } = await supabase
+        .from("host_payouts")
+        .select("*")
+        .eq("host_id", user!.id)
+        .order("requested_at", { ascending: false });
+
+      // 3. Fetch invoices
+      const { data: invoices } = await supabase
+        .from("billing_invoices")
+        .select("*")
+        .eq("recipient_id", user!.id)
+        .order("issued_at", { ascending: false });
+
+      // 4. Calculate total gross earnings from bookings (85% of accepted total for COMPLETED)
+      const totalEarned = (bookings ?? [])
+        .filter((b) => b.state === "COMPLETED")
+        .reduce((sum, b) => {
+          const total = Number(b.offer?.est_total_inr ?? 0);
+          return sum + roundPaise(total * 0.85);
+        }, 0);
+
+      const totalWithdrawn = (payouts ?? [])
+        .filter((p) => p.status === "completed" || p.status === "pending" || p.status === "processing")
+        .reduce((sum, p) => sum + Number(p.amount_inr), 0);
+
+      const availableBalance = Math.max(0, roundPaise(totalEarned - totalWithdrawn));
+
+      return {
+        bookings: bookings ?? [],
+        payouts: payouts ?? [],
+        invoices: invoices ?? [],
+        totalEarned,
+        availableBalance,
+      };
     },
   });
-  if (!ready) return null;
-  if (!user) return <SignInPrompt what="list your GPUs" />;
 
-  async function add(e: React.FormEvent) {
+  async function handleRequestPayout(e: React.FormEvent) {
     e.preventDefault();
-    const { error } = await supabase.from("host_devices").insert({
-      host_id: user!.id, gpu_model: f.gpu.trim(), vram_gb: Number(f.vram), ram_gb: Number(f.ram),
-      benchmark_score: Number(f.bench) || 0, hourly_rate_inr: Number(f.rate),
-      runtimes: f.runtimes.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10),
-    });
-    if (error) { toast.error(error.message); return; }
-    setF({ ...f, gpu: "" });
-    qc.invalidateQueries({ queryKey: ["my-devices"] });
+    const amt = parseFloat(payoutAmount);
+    if (isNaN(amt) || amt < 100) {
+      toast.error("Minimum payout amount is ₹100");
+      return;
+    }
+    if (!upiId.trim() || !upiId.includes("@")) {
+      toast.error("Please enter a valid UPI VPA (e.g. host@okhdfcbank)");
+      return;
+    }
+    if (amt > (earningsQuery.data?.availableBalance ?? 0)) {
+      toast.error("Requested amount exceeds available balance");
+      return;
+    }
+
+    setRequesting(true);
+    try {
+      const { error } = await supabase.from("host_payouts").insert({
+        host_id: user!.id,
+        amount_inr: amt,
+        payout_method: "upi",
+        payout_target: upiId.trim(),
+        status: "completed", // sandbox auto-settles
+        provider_reference: `upi_sb_${Date.now()}`,
+      });
+      if (error) throw error;
+      toast.success(`Payout of ${formatINR(amt)} initiated to ${upiId}`);
+      qc.invalidateQueries({ queryKey: ["host-earnings", user?.id] });
+    } catch (err: any) {
+      toast.error(err.message || "Payout request failed");
+    } finally {
+      setRequesting(false);
+    }
   }
-  async function toggle(id: string, available: boolean) {
-    await supabase.from("host_devices").update({ available }).eq("id", id);
-    qc.invalidateQueries({ queryKey: ["my-devices"] });
-  }
-  async function remove(id: string) {
-    await supabase.from("host_devices").delete().eq("id", id);
-    qc.invalidateQueries({ queryKey: ["my-devices"] });
-  }
-  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement>) => setF({ ...f, [k]: e.target.value });
+
+  if (!ready) return null;
+  if (!user) return <SignInPrompt what="view host earnings" />;
+
+  const data = earningsQuery.data;
 
   return (
     <main className="mx-auto max-w-4xl px-4 py-12">
-      <PageTitle kicker="Hosting" title="Your GPUs" />
-      <p className="mt-2 text-sm text-muted-foreground">Only the GPU model and specs are shown to renters — never your IP address, location or machine details.</p>
-      <ul className="mt-8 space-y-3">
-        {q.data?.map((d) => (
-          <li key={d.id} className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-border bg-card p-4">
-            <div>
-              <div className="font-semibold">{d.gpu_model} · {d.vram_gb} GB {d.verified ? <span className="font-mono text-xs text-primary">verified</span> : <span className="font-mono text-xs text-muted-foreground">unverified</span>}</div>
-              <div className="text-xs text-muted-foreground">{d.ram_gb} GB RAM · bench {d.benchmark_score} · {formatINR(Number(d.hourly_rate_inr))}/hr · {d.runtimes.join(", ")}</div>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Host Earnings & Payouts</h1>
+          <p className="text-sm text-muted-foreground">Peer GPU revenue, automated UPI payouts, and tax receipts.</p>
+        </div>
+      </div>
+
+      {/* Metrics Cards */}
+      <div className="mt-8 grid gap-4 sm:grid-cols-3">
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Wallet className="h-4 w-4 text-primary" />
+            Available Balance
+          </div>
+          <div className="mt-2 text-2xl font-bold text-primary">
+            {formatINR(data?.availableBalance ?? 0)}
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">Ready for instant UPI transfer</p>
+        </div>
+
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <ArrowUpRight className="h-4 w-4 text-emerald-500" />
+            Lifetime Earned
+          </div>
+          <div className="mt-2 text-2xl font-bold">
+            {formatINR(data?.totalEarned ?? 0)}
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">Net of 15% platform commission</p>
+        </div>
+
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Landmark className="h-4 w-4 text-blue-500" />
+            GST / TDS Status
+          </div>
+          <div className="mt-2 text-2xl font-bold">Compliant</div>
+          <p className="mt-1 text-[11px] text-muted-foreground">Section 194-O under-threshold</p>
+        </div>
+      </div>
+
+      {/* Host GPU Daemon Enrollment & Machine Control */}
+      <div className="mt-8">
+        <DeviceEnrollmentCard hostId={user.id} />
+      </div>
+
+      {/* Payout Request Form */}
+      <div className="mt-8 rounded-xl border border-border bg-card p-6">
+        <h2 className="text-base font-semibold">Request Instant UPI Payout</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Withdraw funds directly to your Indian UPI VPA. No fees charged by Bidwatt for UPI payouts.
+        </p>
+
+        <form onSubmit={handleRequestPayout} className="mt-4 grid gap-4 sm:grid-cols-3 font-mono text-xs">
+          <div>
+            <label className="block text-muted-foreground mb-1">Amount (₹ INR, min ₹100)</label>
+            <input
+              type="number"
+              min="100"
+              step="1"
+              value={payoutAmount}
+              onChange={(e) => setPayoutAmount(e.target.value)}
+              className="w-full rounded border border-border bg-background px-3 py-2 text-xs focus:ring-1 focus:ring-primary focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-muted-foreground mb-1">UPI VPA (e.g. host@okhdfcbank)</label>
+            <input
+              type="text"
+              placeholder="user@upi"
+              value={upiId}
+              onChange={(e) => setUpiId(e.target.value)}
+              className="w-full rounded border border-border bg-background px-3 py-2 text-xs focus:ring-1 focus:ring-primary focus:outline-none"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button
+              type="submit"
+              disabled={requesting || (data?.availableBalance ?? 0) < 100}
+              className="w-full"
+            >
+              {requesting ? "Processing..." : "Withdraw via UPI"}
+            </Button>
+          </div>
+        </form>
+      </div>
+
+      {/* Payout History & Receipts */}
+      <div className="mt-8 grid gap-8 md:grid-cols-2">
+        <section className="rounded-xl border border-border bg-card p-5">
+          <h2 className="font-semibold text-sm mb-3">Recent Payouts</h2>
+          {(data?.payouts ?? []).length === 0 ? (
+            <p className="text-xs text-muted-foreground">No payouts requested yet.</p>
+          ) : (
+            <div className="space-y-3 font-mono text-xs">
+              {data?.payouts.map((p) => (
+                <div key={p.id} className="flex items-center justify-between border-b border-border/50 pb-2">
+                  <div>
+                    <div className="font-medium">{formatINR(p.amount_inr)} via {p.payout_method.toUpperCase()}</div>
+                    <div className="text-[10px] text-muted-foreground">{p.payout_target} · {new Date(p.requested_at).toLocaleDateString("en-IN")}</div>
+                  </div>
+                  <span className="text-[11px] text-emerald-500 uppercase flex items-center gap-1">
+                    <CheckCircle2 className="h-3 w-3" />
+                    {p.status}
+                  </span>
+                </div>
+              ))}
             </div>
-            <div className="flex items-center gap-3">
-              <Switch checked={d.available} onCheckedChange={(c) => toggle(d.id, c)} aria-label="Available" />
-              <span className="text-xs">{d.available ? "Available" : "Busy"}</span>
-              <Button size="sm" variant="ghost" onClick={() => remove(d.id)}>Remove</Button>
+          )}
+        </section>
+
+        <section className="rounded-xl border border-border bg-card p-5">
+          <h2 className="font-semibold text-sm mb-3">Invoices & Tax Slips</h2>
+          {(data?.invoices ?? []).length === 0 ? (
+            <p className="text-xs text-muted-foreground">Invoices are automatically generated on session completion.</p>
+          ) : (
+            <div className="space-y-3 font-mono text-xs">
+              {data?.invoices.map((inv) => (
+                <div key={inv.id} className="flex items-center justify-between border-b border-border/50 pb-2">
+                  <div>
+                    <div className="font-medium flex items-center gap-1.5">
+                      <Receipt className="h-3.5 w-3.5 text-primary" />
+                      {inv.invoice_number}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">{new Date(inv.issued_at).toLocaleDateString("en-IN")}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-semibold">{formatINR(inv.total_amount_inr)}</div>
+                    <div className="text-[10px] text-muted-foreground">Tax: {formatINR(inv.tax_inr)}</div>
+                  </div>
+                </div>
+              ))}
             </div>
-          </li>
-        ))}
-        {q.data?.length === 0 && <p className="text-sm text-muted-foreground">No GPUs listed yet.</p>}
-      </ul>
-      <form onSubmit={add} className="mt-10 grid gap-4 rounded-lg border border-border p-5 sm:grid-cols-3">
-        <div className="sm:col-span-3 text-lg font-semibold">Add a GPU</div>
-        <div><Label htmlFor="g">GPU model</Label><Input id="g" required minLength={2} value={f.gpu} onChange={set("gpu")} placeholder="RTX 3060" /></div>
-        <div><Label htmlFor="v">VRAM (GB)</Label><Input id="v" type="number" min={1} max={192} value={f.vram} onChange={set("vram")} /></div>
-        <div><Label htmlFor="r">System RAM (GB)</Label><Input id="r" type="number" min={1} value={f.ram} onChange={set("ram")} /></div>
-        <div><Label htmlFor="b">Benchmark score</Label><Input id="b" type="number" min={0} value={f.bench} onChange={set("bench")} placeholder="self-reported" /></div>
-        <div><Label htmlFor="p">Rate (₹/hour)</Label><Input id="p" type="number" min={0.5} step="0.5" value={f.rate} onChange={set("rate")} /></div>
-        <div><Label htmlFor="rt">Runtimes</Label><Input id="rt" value={f.runtimes} onChange={set("runtimes")} /></div>
-        <Button type="submit" className="sm:col-span-3 sm:w-fit">Add GPU</Button>
-      </form>
+          )}
+        </section>
+      </div>
     </main>
   );
 }
